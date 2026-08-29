@@ -176,7 +176,8 @@ export default function StoryViewer({ route, navigation }) {
   // Advance automatically when a video finishes.
   useEffect(() => {
     if (!isVideo) return;
-    return player.addListener('playToEnd', () => goTo(indexRef.current + 1)).remove;
+    const sub = player.addListener('playToEnd', () => goTo(indexRef.current + 1));
+    return () => sub.remove();
   }, [isVideo, player, goTo]);
 
   useEffect(() => {
