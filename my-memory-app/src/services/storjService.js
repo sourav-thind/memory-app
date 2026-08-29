@@ -1,4 +1,9 @@
-import { S3Client, PutObjectCommand, DeleteObjectCommand } from '@aws-sdk/client-s3';
+import {
+  S3Client,
+  PutObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+} from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
 const STORJ_ENDPOINT = 'https://gateway.storjshare.io';
@@ -38,7 +43,9 @@ export async function uploadSnapFile(fileKey, fileBuffer, contentType) {
 }
 
 export async function getSnapStreamUrl(fileKey, expiresIn = 3600) {
-  const command = new PutObjectCommand({
+  if (!fileKey) return null;
+
+  const command = new GetObjectCommand({
     Bucket: bucketName,
     Key: fileKey,
   });
