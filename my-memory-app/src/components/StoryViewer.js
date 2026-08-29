@@ -1,7 +1,7 @@
 import { useEvent } from 'expo';
 import { Image } from 'expo-image';
 import { useVideoPlayer, VideoView } from 'expo-video';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   PanResponder,
@@ -14,22 +14,21 @@ import { MapPin, X } from 'lucide-react-native';
 
 import { formatCoordinates, reverseGeocode, formatSnapDateTime } from '../utils/format';
 
-const IMAGE_DISPLAY_DURATION = 5000;
+export const IMAGE_DISPLAY_DURATION = 5000;
 const HOLD_THRESHOLD_MS = 250;
 const TAP_MAX_MOVEMENT = 12;
 const SWIPE_DOWN_THRESHOLD = 70;
 const SEGMENT_GAP = 3;
+const PROGRESS_INTERVAL_MS = 100;
 
-function computeProgress(isVideo, currentTime, duration) {
-  if (!isVideo) return 0;
-  if (!duration) return 0;
-  const ratio = currentTime / duration;
-  return Math.max(0, Math.min(1, ratio));
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(value, max));
 }
 
 function TopBar({ visible, onClose, locationName, currentSnap }) {
   const coords = formatCoordinates(currentSnap?.latitude, currentSnap?.longitude);
-  const dateTime = formatSnapDateTime(currentSnap?._timestamp);
+  const timestamp = currentSnap?._timestamp;
+  const dateTime = timestamp ? formatSnapDateTime(timestamp) : '';
 
   return (
     <View style={[styles.topBar, !visible && styles.hidden]}>
@@ -38,11 +37,11 @@ function TopBar({ visible, onClose, locationName, currentSnap }) {
       </TouchableOpacity>
 
       <View style={styles.metaContainer} pointerEvents="none">
-        {dateTime ? <Text style={styles.metaText}>{dateTime}</Text> : null}
+        {dateTime ? <Text style={styles.topBarText}>{dateTime}</Text> : null}
         {locationName || coords ? (
           <View style={styles.locationRow}>
             <MapPin color="#fff" size={14} />
-            <Text style={styles.metaText} numberOfLines={1}>
+            <Text style={styles.topBarText} numberOfLines={1}>
               {locationName || coords}
             </Text>
           </View>
@@ -56,14 +55,14 @@ function ProgressSegments({ segments, visible }) {
   return (
     <View style={[styles.progressContainer, !visible && styles.hidden]} pointerEvents="none">
       {segments.map((segment, i) => {
-        const widthPct = 100 / segments.length;
         const fillPct = segment.isActive ? segment.fill * 100 : segment.isPast ? 100 : 0;
         return (
           <View
             key={i}
             style={[
               styles.segmentTrack,
-              { width: `${widthPct}%`, marginRight: i === segments.length - 1 ? 0 : SEGMENT_GAP },
+              { width: `${100 / segments.length}%` },
+              i < segments.length - 1 && { marginRight: SEGMENT_GAP },
             ]}
           >
             <View style={[styles.segmentFill, { width: `${fillPct}%` }]} />
@@ -80,10 +79,12 @@ export default function StoryViewer({ route, navigation }) {
   const [uiVisible, setUiVisible] = useState(true);
   const [paused, setPaused] = useState(false);
   const [locationName, setLocationName] = useState(null);
+  const [imageProgress, setImageProgress] = useState(0);
 
   const indexRef = useRef(index);
   const pausedRef = useRef(paused);
   const timerRef = useRef(null);
+  const intervalRef = useRef(null);
   const pendingRef = useRef(null);
   const boundsRef = useRef(0);
 
@@ -98,57 +99,74 @@ export default function StoryViewer({ route, navigation }) {
     p.timeUpdateEventInterval = 0.1;
   });
 
-  const { currentTime, duration, status } = useVideoProgress(player, isVideo);
+  const currentTime = useVideoTime(player, isVideo);
+  const duration = isVideo ? player.duration : 0;
+  const status = useVideoStatus(player, isVideo);
 
-  const closeViewer = () => {
-    clearTimer();
-    player.pause();
-    if (navigation?.goBack) navigation.goBack();
-  };
-
-  function clearTimer() {
+  const clearTimers = useCallback(() => {
     if (timerRef.current) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-  }
-
-  function goTo(nextIndex) {
-    clearTimer();
-    const last = safeSnaps.length - 1;
-    if (nextIndex > last) {
-      closeViewer();
-      return;
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
     }
-    if (nextIndex < 0) {
-      return;
-    }
-    setIndex(nextIndex);
-  }
+  }, []);
 
-  const next = () => goTo(indexRef.current + 1);
-  const prev = () => goTo(indexRef.current - 1);
+  const closeViewer = useCallback(() => {
+    clearTimers();
+    player.pause();
+    if (navigation?.goBack) navigation.goBack();
+  }, [clearTimers, navigation, player]);
 
-  // Reset the players/timers whenever the active snap changes.
+  const goTo = useCallback(
+    nextIndex => {
+      clearTimers();
+      if (nextIndex > safeSnaps.length - 1) {
+        closeViewer();
+        return;
+      }
+      if (nextIndex < 0) return;
+      setIndex(nextIndex);
+    },
+    [closeViewer, clearTimers, safeSnaps.length]
+  );
+
+  const next = useCallback(() => goTo(indexRef.current + 1), [goTo]);
+  const prev = useCallback(() => goTo(indexRef.current - 1), [goTo]);
+
+  const currentSnap = safeSnaps[index];
+
+  // Reset timers/players whenever the active snap changes.
   useEffect(() => {
-    const snap = safeSnaps[index];
-    if (!snap) return;
-
+    if (!currentSnap) return;
+    clearTimers();
+    setImageProgress(0);
     setLocationName(null);
+
     if (isVideo) {
-      player.replace(snap.mainUrl);
+      player.replace(currentSnap.mainUrl);
       if (!pausedRef.current) player.play();
     } else {
       player.pause();
-    }
-
-    if (!isVideo && !pausedRef.current) {
-      timerRef.current = setTimeout(() => goTo(indexRef.current + 1), IMAGE_DISPLAY_DURATION);
+      if (!pausedRef.current) {
+        const startedAt = Date.now();
+        intervalRef.current = setInterval(() => {
+          const elapsed = Date.now() - startedAt;
+          const progress = clamp(elapsed / IMAGE_DISPLAY_DURATION, 0, 1);
+          setImageProgress(progress);
+          if (progress >= 1) {
+            clearTimers();
+            goTo(indexRef.current + 1);
+          }
+        }, PROGRESS_INTERVAL_MS);
+      }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index, isVideo]);
+  }, [index]);
 
-  // Keep pause/resume in sync with paused state.
+  // Keep play/pause in sync with paused state.
   useEffect(() => {
     if (!isVideo) return;
     if (pausedRef.current) player.pause();
@@ -156,34 +174,45 @@ export default function StoryViewer({ route, navigation }) {
   }, [isVideo, paused, player]);
 
   // Advance automatically when a video finishes.
-  useEventListenerForEnd(player, isVideo, goTo, indexRef);
+  useEffect(() => {
+    if (!isVideo) return;
+    return player.addListener('playToEnd', () => goTo(indexRef.current + 1)).remove;
+  }, [isVideo, player, goTo]);
 
   useEffect(() => {
-    const snap = safeSnaps[index];
-    if (!snap || snap.latitude == null) return;
+    if (!currentSnap || currentSnap.latitude == null) return;
     let active = true;
-    reverseGeocode(snap.latitude, snap.longitude).then(name => {
+    reverseGeocode(currentSnap.latitude, currentSnap.longitude).then(name => {
       if (active && name) setLocationName(name);
     });
     return () => { active = false; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [index]);
+  }, [currentSnap]);
 
-  function startHold() {
+  const suspendPlayback = useCallback(() => {
     setPaused(true);
     setUiVisible(false);
-    clearTimer();
+    clearTimers();
     if (isVideo) player.pause();
-  }
+  }, [isVideo, player, clearTimers]);
 
-  function endHold() {
+  const resumePlayback = useCallback(() => {
     setPaused(false);
     setUiVisible(true);
-    if (isVideo) player.play();
-    else if (!pausedRef.current) {
-      timerRef.current = setTimeout(() => goTo(indexRef.current + 1), IMAGE_DISPLAY_DURATION);
+    if (isVideo) {
+      player.play();
+    } else {
+      const startedAt = Date.now();
+      intervalRef.current = setInterval(() => {
+        const elapsed = Date.now() - startedAt;
+        const progress = clamp(elapsed / IMAGE_DISPLAY_DURATION, 0, 1);
+        setImageProgress(progress);
+        if (progress >= 1) {
+          clearTimers();
+          goTo(indexRef.current + 1);
+        }
+      }, PROGRESS_INTERVAL_MS);
     }
-  }
+  }, [isVideo, player, clearTimers, goTo]);
 
   const panResponder = useMemo(
     () =>
@@ -199,13 +228,16 @@ export default function StoryViewer({ route, navigation }) {
             holdTimer: setTimeout(() => {
               if (pendingRef.current) {
                 pendingRef.current.holdFired = true;
-                startHold();
+                suspendPlayback();
               }
             }, HOLD_THRESHOLD_MS),
           };
         },
         onPanResponderMove: (evt, g) => {
-          if (pendingRef.current && (Math.abs(g.dx) > TAP_MAX_MOVEMENT || Math.abs(g.dy) > TAP_MAX_MOVEMENT)) {
+          if (
+            pendingRef.current &&
+            (Math.abs(g.dx) > TAP_MAX_MOVEMENT || Math.abs(g.dy) > TAP_MAX_MOVEMENT)
+          ) {
             clearTimeout(pendingRef.current.holdTimer);
             pendingRef.current.moved = true;
           }
@@ -219,18 +251,18 @@ export default function StoryViewer({ route, navigation }) {
 
           // Swipe down to exit.
           if (g.dy > SWIPE_DOWN_THRESHOLD && Math.abs(g.dy) > Math.abs(g.dx)) {
-            endHold();
+            resumePlayback();
             closeViewer();
             return;
           }
 
           if (pending.holdFired) {
-            endHold();
+            resumePlayback();
             return;
           }
 
           if (pending.moved) {
-            endHold();
+            resumePlayback();
             return;
           }
 
@@ -243,22 +275,22 @@ export default function StoryViewer({ route, navigation }) {
           pendingRef.current = null;
           if (pending) {
             clearTimeout(pending.holdTimer);
-            if (pending.holdFired) endHold();
+            if (pending.holdFired) resumePlayback();
           }
         },
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [isVideo]
+    [isVideo, next, prev, closeViewer, suspendPlayback, resumePlayback]
   );
 
-  const progress = computeProgress(isVideo, currentTime, duration);
+  const progress = isVideo
+    ? clamp(duration ? currentTime / duration : 0, 0, 1)
+    : imageProgress;
 
   const segments = safeSnaps.map((snap, i) => ({
     fill: i === index ? progress : i < index ? 1 : 0,
     isPast: i < index,
   }));
-
-  const currentSnap = safeSnaps[index];
 
   if (!currentSnap) {
     return (
@@ -301,7 +333,9 @@ export default function StoryViewer({ route, navigation }) {
       ) : null}
 
       {isVideo && status === 'loading' ? (
-        <ActivityIndicator color="#fff" style={styles.media} size="large" />
+        <View style={styles.media}>
+          <ActivityIndicator color="#fff" size="large" />
+        </View>
       ) : null}
 
       <ProgressSegments segments={segments} visible={uiVisible} />
@@ -322,27 +356,14 @@ export default function StoryViewer({ route, navigation }) {
   );
 }
 
-function useVideoProgress(player, isVideo) {
-  const timeUpdate = useEvent(player, 'timeUpdate', {
-    currentTime: player.currentTime,
-  });
-  const statusChange = useEvent(player, 'statusChange', { status: player.status });
-
-  return {
-    currentTime: isVideo ? timeUpdate.currentTime : 0,
-    duration: player.duration,
-    status: statusChange.status,
-  };
+function useVideoTime(player, isVideo) {
+  const event = useEvent(player, 'timeUpdate', { currentTime: player.currentTime });
+  return isVideo ? event.currentTime : 0;
 }
 
-function useEventListenerForEnd(player, isVideo, onEnd, indexRef) {
-  useEffect(() => {
-    if (!isVideo) return;
-    const sub = player.addListener('playToEnd', () => {
-      onEnd(indexRef.current + 1);
-    });
-    return () => sub.remove();
-  }, [isVideo, player, onEnd, indexRef]);
+function useVideoStatus(player, isVideo) {
+  const event = useEvent(player, 'statusChange', { status: player.status });
+  return isVideo ? event.status : undefined;
 }
 
 const styles = StyleSheet.create({
@@ -352,6 +373,8 @@ const styles = StyleSheet.create({
   },
   media: {
     ...StyleSheet.absoluteFillObject,
+    alignItems: 'center',
+    justifyContent: 'center',
   },
   hidden: {
     opacity: 0,
@@ -362,14 +385,13 @@ const styles = StyleSheet.create({
     left: 10,
     right: 10,
     flexDirection: 'row',
-    zIndex: 20,
+    zIndex: 30,
   },
   segmentTrack: {
     height: 3,
     borderRadius: 2,
-    backgroundColor: 'rgba(255,255,255,0.3)',
+    backgroundColor: 'rgba(255,255,255,0.35)',
     overflow: 'hidden',
-    flexGrow: 1,
   },
   segmentFill: {
     height: '100%',
@@ -378,12 +400,12 @@ const styles = StyleSheet.create({
   },
   topBar: {
     position: 'absolute',
-    top: 58,
+    top: 64,
     left: 12,
     right: 12,
     flexDirection: 'row',
     alignItems: 'flex-start',
-    zIndex: 10,
+    zIndex: 20,
   },
   closeButton: {
     padding: 4,
@@ -392,7 +414,7 @@ const styles = StyleSheet.create({
   metaContainer: {
     flex: 1,
   },
-  metaText: {
+  topBarText: {
     color: '#fff',
     fontSize: 14,
     fontWeight: '600',
@@ -410,7 +432,7 @@ const styles = StyleSheet.create({
     left: 16,
     right: 16,
     bottom: 48,
-    zIndex: 10,
+    zIndex: 20,
   },
   captionText: {
     color: '#fff',
