@@ -1,6 +1,6 @@
 import { Image } from 'expo-image';
 import * as DocumentPicker from 'expo-document-picker';
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -12,10 +12,10 @@ import {
 } from 'react-native';
 import { Plus, Video } from 'lucide-react-native';
 
+import DropZoneUpload from '../components/DropZoneUpload';
 import { supabase } from '../lib/supabase';
 import { getThumbnailKey, resolveSnapMedia, resolveSnapUrl } from '../services/mediaService';
-import { uploadSnapsBatch } from '../services/uploadManager';
-import { parseSnapchatZip } from '../utils/snapchatParser';
+import { ingestZip } from '../services/uploadManager';
 import { groupSnapsByMonthYear } from '../utils/groupSnaps';
 
 const CELL_HEIGHTS = [150, 200, 240, 180, 220];
@@ -99,11 +99,32 @@ function splitColumns(snaps) {
   return [colA, colB];
 }
 
+function formatRemaining(seconds) {
+  if (!Number.isFinite(seconds) || seconds <= 0) return '';
+  if (seconds < 60) return `${Math.ceil(seconds)}s`;
+  const mins = Math.floor(seconds / 60);
+  const secs = Math.floor(seconds % 60);
+  return `${mins}m ${secs}s`;
+}
+
+function useMemoUploadEta(progress, startTime, active) {
+  return useMemo(() => {
+    if (!active || progress.phase !== 'uploading' || progress.total === 0) return '';
+    const completed = Math.max(0, Math.min(progress.total, progress.completed));
+    if (completed === 0 || !startTime) return '';
+    const elapsed = Date.now() - startTime;
+    const perUnit = elapsed / completed;
+    const remainingMs = perUnit * (progress.total - completed);
+    return formatRemaining(remainingMs / 1000);
+  }, [active, progress, startTime]);
+}
+
 export default function MemoriesScreen({ navigation }) {
   const [groups, setGroups] = useState([]);
   const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
-  const [uploadProgress, setUploadProgress] = useState({ completed: 0, total: 0 });
+  const [uploadProgress, setUploadProgress] = useState({ phase: 'uploading', completed: 0, total: 0 });
+  const [uploadStart, setUploadStart] = useState(0);
   const userRef = useRef(null);
 
   const loadSnaps = useCallback(async () => {
@@ -154,6 +175,21 @@ export default function MemoriesScreen({ navigation }) {
     }
   };
 
+  const handleUploadComplete = async batch => {
+    const added = batch?.succeeded?.length || 0;
+    const failed = batch?.failed?.length || 0;
+    if (added > 0) {
+      Alert.alert('Upload complete', `${added} memories added.`);
+    } else if (failed > 0) {
+      Alert.alert('Upload finished with errors', `${failed} file(s) failed after retries.`);
+    }
+    await loadSnaps();
+  };
+
+  const handleUploadFailure = err => {
+    Alert.alert('Upload failed', err.message);
+  };
+
   const handleUpload = async () => {
     try {
       const result = await DocumentPicker.getDocumentAsync({
@@ -166,29 +202,23 @@ export default function MemoriesScreen({ navigation }) {
 
       const asset = result.assets[0];
       setUploading(true);
-      setUploadProgress({ completed: 0, total: 0 });
+      setUploadStart(Date.now());
+      setUploadProgress({ phase: 'extracting', completed: 0, total: 1 });
 
-      const parsed = await parseSnapchatZip(asset.uri);
-
-      if (!parsed.length) {
-        setUploading(false);
-        Alert.alert('No memories found', 'No valid Snapchat media was found in that ZIP file.');
-        return;
-      }
-
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) {
-        setUploading(false);
-        Alert.alert('Not signed in', 'Please sign in to upload memories.');
-        return;
-      }
-
-      await uploadSnapsBatch(parsed, user.id, (completed, total) => {
-        setUploadProgress({ completed, total });
+      const { result: batch } = await ingestZip(asset.uri, {
+        onProgress: payload => setUploadProgress(payload),
       });
 
       setUploading(false);
-      Alert.alert('Upload complete', `${parsed.length} memories added.`);
+      const added = batch.succeeded.length;
+      if (added > 0) {
+        Alert.alert('Upload complete', `${added} memories added.`);
+      } else if (batch.failed.length) {
+        Alert.alert(
+          'Upload finished with errors',
+          `${batch.failed.length} file(s) failed after retries.`
+        );
+      }
       await loadSnaps();
     } catch (err) {
       setUploading(false);
@@ -196,12 +226,29 @@ export default function MemoriesScreen({ navigation }) {
     }
   };
 
+  const percent = uploadProgress.total
+    ? Math.round(
+        (Math.max(0, Math.min(uploadProgress.total, uploadProgress.completed)) /
+          uploadProgress.total) *
+          100
+      )
+    : 0;
+
+  const etaText = useMemoUploadEta(uploadProgress, uploadStart, uploading);
+
   const emptyState = (
-    <View style={styles.center}>
+    <View style={styles.emptyWrap}>
+      <View style={styles.emptyIllustration}>
+        <Plus color="#fff" size={40} />
+      </View>
       <Text style={styles.emptyTitle}>No memories yet</Text>
       <Text style={styles.emptySubtitle}>
-        Tap the + button to import your Snapchat ZIP.
+        Your Snapchat Stories will appear here once you upload them.
       </Text>
+      <TouchableOpacity style={styles.emptyCta} onPress={handleUpload} activeOpacity={0.85}>
+        <Plus color="#111" size={20} style={styles.emptyCtaIcon} />
+        <Text style={styles.emptyCtaText}>Upload your Snapchat Memories ZIP</Text>
+      </TouchableOpacity>
     </View>
   );
 
@@ -222,12 +269,26 @@ export default function MemoriesScreen({ navigation }) {
         {uploading ? <ActivityIndicator color="#fff" /> : <Plus color="#fff" size={28} />}
       </TouchableOpacity>
 
+      {/* Web/desktop drag-and-drop + progress modal */}
+      <DropZoneUpload onComplete={handleUploadComplete} onError={handleUploadFailure} />
+
       {uploading ? (
         <View style={styles.uploadOverlay}>
-          <ActivityIndicator color="#fff" size="large" />
-          <Text style={styles.uploadOverlayText}>
-            Importing memories… {uploadProgress.completed}/{uploadProgress.total}
-          </Text>
+          <View style={styles.uploadCard}>
+            <Text style={styles.uploadOverlayTitle}>
+              {uploadProgress.phase === 'extracting' ? 'Extracting memories…' : 'Uploading memories…'}
+            </Text>
+            <View style={styles.uploadTrack}>
+              <View style={[styles.uploadFill, { width: `${percent}%` }]} />
+            </View>
+            <Text style={styles.uploadOverlayText}>{percent}%</Text>
+            <Text style={styles.uploadOverlaySubtext}>
+              {uploadProgress.currentFile
+                ? `Uploading ${uploadProgress.currentFile === 'overlay' ? 'overlay' : 'main'} file`
+                : `Completed ${uploadProgress.completed} / ${uploadProgress.total}`}
+            </Text>
+            {etaText ? <Text style={styles.uploadEta}>~{etaText} remaining</Text> : null}
+          </View>
         </View>
       ) : null}
     </View>
@@ -288,22 +349,49 @@ const styles = StyleSheet.create({
     borderRadius: 12,
     padding: 6,
   },
-  center: {
-    flex: 1,
+  emptyWrap: {
     alignItems: 'center',
     justifyContent: 'center',
-    padding: 32,
+    paddingHorizontal: 32,
+    paddingVertical: 80,
+  },
+  emptyIllustration: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: '#111',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginBottom: 20,
   },
   emptyTitle: {
-    fontSize: 18,
-    fontWeight: '600',
-    color: '#333',
+    fontSize: 20,
+    fontWeight: '700',
+    color: '#111',
     marginBottom: 8,
   },
   emptySubtitle: {
     fontSize: 15,
     color: '#777',
     textAlign: 'center',
+    marginBottom: 24,
+    maxWidth: 320,
+  },
+  emptyCta: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#111',
+    borderRadius: 12,
+    paddingVertical: 14,
+    paddingHorizontal: 20,
+  },
+  emptyCtaIcon: {
+    marginRight: 8,
+  },
+  emptyCtaText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
   },
   fab: {
     position: 'absolute',
@@ -326,11 +414,48 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0,0,0,0.55)',
     alignItems: 'center',
     justifyContent: 'center',
+    padding: 24,
+  },
+  uploadCard: {
+    width: '100%',
+    maxWidth: 420,
+    backgroundColor: '#fff',
+    borderRadius: 16,
+    padding: 24,
+    alignItems: 'center',
+  },
+  uploadOverlayTitle: {
+    color: '#111',
+    fontSize: 17,
+    fontWeight: '700',
+    marginBottom: 20,
+  },
+  uploadTrack: {
+    width: '100%',
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: '#e6e6e6',
+    overflow: 'hidden',
+  },
+  uploadFill: {
+    height: '100%',
+    backgroundColor: '#111',
+    borderRadius: 4,
   },
   uploadOverlayText: {
-    color: '#fff',
-    marginTop: 16,
-    fontSize: 16,
-    fontWeight: '600',
+    color: '#111',
+    marginTop: 10,
+    fontSize: 26,
+    fontWeight: '800',
+  },
+  uploadOverlaySubtext: {
+    color: '#555',
+    marginTop: 6,
+    fontSize: 14,
+  },
+  uploadEta: {
+    color: '#999',
+    marginTop: 4,
+    fontSize: 13,
   },
 });
