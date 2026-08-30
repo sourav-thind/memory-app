@@ -2,6 +2,7 @@ import JSZip from 'jszip';
 
 const MAIN_PATTERN = /^(.+)-main\.(jpg|jpeg|png|mp4|mov)$/i;
 const OVERLAY_PATTERN = /^(.+)-overlay\.png$/i;
+const YIELD_EVERY = 4;
 
 function extractBaseId(filename) {
   const mainMatch = filename.match(MAIN_PATTERN);
@@ -17,6 +18,46 @@ function parseMediaType(filename) {
   const ext = filename.split('.').pop().toLowerCase();
   if (['mp4', 'mov'].includes(ext)) return 'video';
   return 'image';
+}
+
+function isBlobLike(value) {
+  return typeof Blob !== 'undefined' && value instanceof Blob;
+}
+
+// Cooperative yield to the event loop so heavy ZIP processing (multi-GB archives)
+// never blocks the UI thread on Web/Desktop. This gives the browser time to
+// repaint and handle user input between chunks.
+function yieldToMain() {
+  return new Promise(resolve => setTimeout(resolve, 0));
+}
+
+function isObjectUrl(value) {
+  return typeof value === 'string' && value.startsWith('blob:');
+}
+
+function revokeUrl(url) {
+  if (typeof URL === 'undefined' || !url) return;
+  if (isObjectUrl(url)) URL.revokeObjectURL(url);
+}
+
+async function readInputAsArrayBuffer(input) {
+  // Web/Desktop drag-and-drop passes a real Blob/File directly. Reading it
+  // directly avoids creating an object URL that would need cleanup.
+  if (isBlobLike(input)) {
+    return await input.arrayBuffer();
+  }
+
+  if (typeof input === 'string') {
+    const response = await fetch(input);
+    const blob = await response.blob();
+    try {
+      return await blob.arrayBuffer();
+    } finally {
+      revokeUrl(input);
+    }
+  }
+
+  throw new Error('Unsupported ZIP input. Provide a URI or a File/Blob.');
 }
 
 async function parseMemoriesHistory(zip) {
@@ -41,10 +82,22 @@ async function parseMemoriesHistory(zip) {
   return lookup;
 }
 
-export async function parseSnapchatZip(fileUri) {
-  const response = await fetch(fileUri);
-  const blob = await response.blob();
-  const arrayBuffer = await blob.arrayBuffer();
+/**
+ * Parse a Snapchat Memories ZIP into a batch of snaps.
+ *
+ * `input` may be either:
+ *   - a string URI (native: file:// or content://; web: http(s) or blob: URL), or
+ *   - a Blob/File (web/desktop drag-and-drop).
+ *
+ * Extraction processes ZIP entries sequentially with cooperative yielding to
+ * avoid freezing the UI thread on large archives. `onProgress` is invoked with
+ * `{ phase: 'extracting', completed, total }`.
+ */
+export async function parseSnapchatZip(input, onProgress) {
+  const arrayBuffer = await readInputAsArrayBuffer(input);
+
+  // loadAsync parses the central directory; cannot be easily chunked by JSZip,
+  // but for typical archives this is far cheaper than decompressing every entry.
   const zip = await JSZip.loadAsync(arrayBuffer);
 
   const history = await parseMemoriesHistory(zip);
@@ -80,11 +133,17 @@ export async function parseSnapchatZip(fileUri) {
     }
   });
 
+  const baseIds = Object.keys(snapsByBaseId);
   const snaps = [];
 
-  for (const baseId of Object.keys(snapsByBaseId)) {
+  // Decompress each snap's files one at a time, yielding to the event loop
+  // between batches so the UI thread stays responsive during multi-GB unzips.
+  for (let i = 0; i < baseIds.length; i++) {
+    const baseId = baseIds[i];
     const snap = snapsByBaseId[baseId];
     if (!snap.mainFile) continue;
+
+    if (i % YIELD_EVERY === 0) await yieldToMain();
 
     const mainBlob = await snap.mainFile.async('blob');
     const mainArrayBuffer = await mainBlob.arrayBuffer();
@@ -111,6 +170,8 @@ export async function parseSnapchatZip(fileUri) {
       longitude: historyEntry.longitude || null,
       caption: historyEntry.caption || '',
     });
+
+    if (onProgress) onProgress({ phase: 'extracting', completed: i + 1, total: baseIds.length });
   }
 
   snaps.sort((a, b) => {
