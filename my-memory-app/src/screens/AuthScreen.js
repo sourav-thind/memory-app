@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -11,49 +11,66 @@ import {
 
 import { supabase } from '../lib/supabase';
 
-export default function AuthScreen({ navigation }) {
-  const [checking, setChecking] = useState(true);
+export default function AuthScreen() {
+  const [mode, setMode] = useState('login');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [submitting, setSubmitting] = useState(false);
 
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (data.session) {
-        navigation.replace('Memories');
-      } else {
-        setChecking(false);
-      }
-    });
-  }, [navigation]);
-
-  const handleSignIn = async () => {
+  const handleSubmit = async () => {
     if (!email || !password) {
       Alert.alert('Missing details', 'Please enter your email and password.');
       return;
     }
+
     setSubmitting(true);
-    const { error } = await supabase.auth.signInWithPassword({ email, password });
+
+    const { error } =
+      mode === 'login'
+        ? await supabase.auth.signInWithPassword({ email, password })
+        : await supabase.auth.signUp({ email, password });
+
     setSubmitting(false);
-    if (error) Alert.alert('Sign in failed', error.message);
-  };
 
-  const handleStart = () => {
-    navigation.replace('Memories');
-  };
+    if (error) {
+      Alert.alert(mode === 'login' ? 'Sign in failed' : 'Sign up failed', error.message);
+      return;
+    }
 
-  if (checking) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator size="large" color="#111" />
-      </View>
-    );
-  }
+    if (mode === 'signup') {
+      // Supabase may require email confirmation; the parent App picks up the
+      // session via onAuthStateChange when it becomes available.
+      Alert.alert(
+        'Account created',
+        'Please check your email to confirm your account (if required), then sign in.'
+      );
+      setMode('login');
+    }
+  };
 
   return (
     <View style={styles.container}>
       <Text style={styles.title}>Snapchat Memories</Text>
       <Text style={styles.subtitle}>Your Stories, preserved forever.</Text>
+
+      <View style={styles.toggle}>
+        <TouchableOpacity
+          style={[styles.toggleButton, mode === 'login' && styles.toggleActive]}
+          onPress={() => setMode('login')}
+        >
+          <Text style={[styles.toggleText, mode === 'login' && styles.toggleTextActive]}>
+            Login
+          </Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          style={[styles.toggleButton, mode === 'signup' && styles.toggleActive]}
+          onPress={() => setMode('signup')}
+        >
+          <Text style={[styles.toggleText, mode === 'signup' && styles.toggleTextActive]}>
+            Sign Up
+          </Text>
+        </TouchableOpacity>
+      </View>
 
       <View style={styles.form}>
         <TextInput
@@ -72,20 +89,16 @@ export default function AuthScreen({ navigation }) {
           value={password}
           onChangeText={setPassword}
           secureTextEntry
-          autoComplete="password"
+          autoComplete={mode === 'login' ? 'current-password' : 'new-password'}
           placeholderTextColor="#999"
         />
 
-        <TouchableOpacity style={styles.button} onPress={handleSignIn} disabled={submitting}>
+        <TouchableOpacity style={styles.button} onPress={handleSubmit} disabled={submitting}>
           {submitting ? (
             <ActivityIndicator color="#fff" />
           ) : (
-            <Text style={styles.buttonText}>Sign In</Text>
+            <Text style={styles.buttonText}>{mode === 'login' ? 'Sign In' : 'Create Account'}</Text>
           )}
-        </TouchableOpacity>
-
-        <TouchableOpacity style={styles.demoButton} onPress={handleStart}>
-          <Text style={styles.demoButtonText}>Continue without signing in</Text>
         </TouchableOpacity>
       </View>
     </View>
@@ -100,12 +113,6 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     padding: 24,
   },
-  center: {
-    flex: 1,
-    backgroundColor: '#fff',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
   title: {
     fontSize: 28,
     fontWeight: '700',
@@ -116,6 +123,32 @@ const styles = StyleSheet.create({
     fontSize: 16,
     color: '#666',
     marginBottom: 32,
+  },
+  toggle: {
+    flexDirection: 'row',
+    backgroundColor: '#f0f0f0',
+    borderRadius: 12,
+    padding: 4,
+    marginBottom: 20,
+    width: '100%',
+    maxWidth: 380,
+  },
+  toggleButton: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: 9,
+    alignItems: 'center',
+  },
+  toggleActive: {
+    backgroundColor: '#111',
+  },
+  toggleText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#555',
+  },
+  toggleTextActive: {
+    color: '#fff',
   },
   form: {
     width: '100%',
@@ -142,14 +175,5 @@ const styles = StyleSheet.create({
     color: '#fff',
     fontSize: 17,
     fontWeight: '600',
-  },
-  demoButton: {
-    marginTop: 20,
-    alignItems: 'center',
-  },
-  demoButtonText: {
-    color: '#555',
-    fontSize: 15,
-    textDecorationLine: 'underline',
   },
 });
